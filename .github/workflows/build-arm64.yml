@@ -1,0 +1,103 @@
+name: Build ARM64 image
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # to update last-built-sha.txt
+  packages: write # to push the image to GHCR
+
+concurrency:
+  group: build-arm64
+  cancel-in-progress: false
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Get upstream HEAD
+        id: upstream
+        run: |
+          SHA=$(git ls-remote https://github.com/ravelon-app/ravelon-sync.git refs/heads/main | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD: $SHA"
+
+      - name: Compare with last built SHA
+        id: decide
+        run: |
+          LAST_BUILT=$(cat last-built-sha.txt 2>/dev/null | tr -d '[:space:]' || true)
+          echo "Last built: ${LAST_BUILT:-<none>}"
+          if [ -n "$LAST_BUILT" ] && [ "$LAST_BUILT" != "none" ] && [ "$LAST_BUILT" = "${{ steps.upstream.outputs.sha }}" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged, skipping build."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream updated, will build."
+          fi
+
+      - name: Check out upstream at new HEAD
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ravelon-app/ravelon-sync
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: upstream
+
+      - name: Set up QEMU
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version
+        if: steps.decide.outputs.build == 'true'
+        id: version
+        run: |
+          VER=$(jq -r .version upstream/package.json 2>/dev/null || echo 0.0.0)
+          SHORT="${{ steps.upstream.outputs.sha }}"
+          SHORT="${SHORT:0:7}"
+          echo "version=${VER}+sha.${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ARM64 image
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/ravelon-sync-arm64:latest
+            ghcr.io/${{ github.repository_owner }}/ravelon-sync-arm64:sha-${{ steps.version.outputs.short }}
+          build-args: |
+            RAVELON_SYNC_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record built SHA
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.sha }}" > last-built-sha.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-built-sha.txt
+          git commit -m "Build arm64 image for upstream ${{ steps.upstream.outputs.sha }}" || echo "nothing to commit"
+          git push
